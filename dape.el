@@ -70,6 +70,12 @@
   "Directory to store downloaded adapters in."
   :type 'string)
 
+(defcustom dape-use-completing-read t
+  "Use `completing-read' instead of `read-from-minibuffer' for adapter selection.
+When non-nil, provides better integration with completion frameworks like Vertico.
+When nil, uses the original read-from-minibuffer implementation."
+  :type 'boolean)
+
 (defcustom dape-configs
   `((attach
      modes nil
@@ -5860,7 +5866,11 @@ nil."
   "Read configuration from minibuffer.
 Completes from suggested conjurations, a configuration is suggested if
 it's for current `major-mode' and it's available.
-See `modes' and `ensure' in `dape-configs'."
+See `modes' and `ensure' in `dape-configs'.
+When `dape-use-completing-read' is non-nil (default), uses `completing-read'
+which provides better integration with completion frameworks like Vertico, Ivy,
+and Helm. When nil, falls back to the original `read-from-minibuffer'
+implementation which provides inline hints and custom keybindings."
   (run-hooks 'dape-read-config-hook)
   (let* ((suggested-configs
           (cl-loop for (name . config) in dape-configs
@@ -5894,57 +5904,73 @@ See `modes' and `ensure' in `dape-configs'."
                (format "%s " key))))))
     (setq dape--minibuffer-last-buffer (current-buffer)
           dape--minibuffer-cache nil)
-    (minibuffer-with-setup-hook
-        (lambda ()
-          (setq-local dape--minibuffer-suggestions suggested-configs
-                      comint-completion-addsuffix nil
-                      resize-mini-windows t
-                      max-mini-window-height 0.5
-                      dape--minibuffer-hint-overlay (make-overlay (point) (point))
-                      default-directory (dape-command-cwd)
-                      ;; Store origin buffer `dape-configs' value
-                      dape-configs (buffer-local-value
-                                    'dape-configs dape--minibuffer-last-buffer))
-          (set-syntax-table emacs-lisp-mode-syntax-table)
-          (add-hook 'completion-at-point-functions
-                    #'comint-filename-completion nil t)
-          (add-hook 'completion-at-point-functions
-                    #'dape--config-completion-at-point nil t)
-          (add-hook 'after-change-functions
-                    #'dape--minibuffer-hint nil t)
-          (dape--minibuffer-hint))
-      (pcase-let*
-          ((str
-            (let ((history-add-new-input (eq dape-history-add 'input)))
-              (read-from-minibuffer
-               "Run adapter: "
-               initial-contents
-               (let ((map (make-sparse-keymap)))
-                 (set-keymap-parent map minibuffer-local-map)
-                 (define-key map (kbd "C-M-i") #'completion-at-point)
-                 (define-key map "\t" #'completion-at-point)
-                 ;; This mapping is shadowed by `next-history-element'
-                 ;; future history (default-value)
-                 (define-key map (kbd "C-c C-k")
-                             (lambda ()
-                               (interactive)
-                               (pcase-let*
-                                   ((str (buffer-substring (minibuffer-prompt-end)
-                                                           (point-max)))
-                                    (`(,key) (dape--config-from-string str)))
-                                 (delete-region (minibuffer-prompt-end)
-                                                (point-max))
-                                 (insert (format "%s" key) " "))))
-                 map)
-               nil 'dape-history default-value)))
-           (`(,key ,config)
-            (dape--config-from-string (substring-no-properties str)))
-           (evaled-config
-            (let ((default-directory (dape--guess-root config)))
-              (dape--config-eval key config))))
-        (unless (eq dape-history-add 'input)
-          (push (dape--config-to-string key evaled-config) dape-history))
-        evaled-config))))
+    (if dape-use-completing-read
+        (let ((str (completing-read
+                    "Run adapter: "
+                    (mapcar #'car dape-configs)
+                    nil t
+                    (when default-value (cadr default-value))
+                    'dape-history)))
+          (pcase-let*
+              ((`(,key ,config)
+                (dape--config-from-string (concat str " ")))
+               (evaled-config
+                (let ((default-directory (dape--guess-root config)))
+                  (dape--config-eval key config))))
+            (unless (eq dape-history-add 'input)
+              (push (dape--config-to-string key evaled-config) dape-history))
+            evaled-config))
+      (minibuffer-with-setup-hook
+          (lambda ()
+            (setq-local dape--minibuffer-suggestions suggested-configs
+                        comint-completion-addsuffix nil
+                        resize-mini-windows t
+                        max-mini-window-height 0.5
+                        dape--minibuffer-hint-overlay (make-overlay (point) (point))
+                        default-directory (dape-command-cwd)
+                        ;; Store origin buffer `dape-configs' value
+                        dape-configs (buffer-local-value
+                                      'dape-configs dape--minibuffer-last-buffer))
+            (set-syntax-table emacs-lisp-mode-syntax-table)
+            (add-hook 'completion-at-point-functions
+                      #'comint-filename-completion nil t)
+            (add-hook 'completion-at-point-functions
+                      #'dape--config-completion-at-point nil t)
+            (add-hook 'after-change-functions
+                      #'dape--minibuffer-hint nil t)
+            (dape--minibuffer-hint))
+        (pcase-let*
+            ((str
+              (let ((history-add-new-input (eq dape-history-add 'input)))
+                (read-from-minibuffer
+                 "Run adapter: "
+                 initial-contents
+                 (let ((map (make-sparse-keymap)))
+                   (set-keymap-parent map minibuffer-local-map)
+                   (define-key map (kbd "C-M-i") #'completion-at-point)
+                   (define-key map "\t" #'completion-at-point)
+                   ;; This mapping is shadowed by `next-history-element'
+                   ;; future history (default-value)
+                   (define-key map (kbd "C-c C-k")
+                               (lambda ()
+                                 (interactive)
+                                 (pcase-let*
+                                     ((str (buffer-substring (minibuffer-prompt-end)
+                                                             (point-max)))
+                                      (`(,key) (dape--config-from-string str)))
+                                   (delete-region (minibuffer-prompt-end)
+                                                  (point-max))
+                                   (insert (format "%s" key) " "))))
+                   map)
+                 nil 'dape-history default-value)))
+             (`(,key ,config)
+              (dape--config-from-string (substring-no-properties str)))
+             (evaled-config
+              (let ((default-directory (dape--guess-root config)))
+                (dape--config-eval key config))))
+          (unless (eq dape-history-add 'input)
+            (push (dape--config-to-string key evaled-config) dape-history))
+          evaled-config)))))
 
 
 ;;; Hover
